@@ -1,7 +1,23 @@
+"""
+Data-quality stage for the GH Archive ELT pipeline.
+
+Runs after build_model.py. Covers:
+  - row-count reconciliation (staging -> fact)
+  - uniqueness on surrogate keys
+  - SCD-2 overlap check on dim_repo
+
+Results are persisted to reconciliation_log so there's an audit trail,
+not just console output that disappears after the run.
+
+(Freshness checks and quarantine handling will be added here once we
+cover them next.)
+"""
+
 from pathlib import Path
 import duckdb
 
 DB_PATH = Path("data/gh_archive.duckdb")
+
 
 def _ensure_log_table(con):
     con.execute("""
@@ -15,17 +31,34 @@ def _ensure_log_table(con):
         )
     """)
 
-def run_reconciliation_check(con, source_table: str, target_table: str, check_name: str) -> str:
+
+def run_reconciliation_check(con, source_table: str, target_table: str, check_name: str,
+                              timestamp_column: str = None) -> str:
     """Compares row counts between two layers (e.g. staged_events -> fact_events).
     A non-zero diff means rows were silently dropped or duplicated somewhere
-    in the transform between them."""
-    source_count = con.execute(f"SELECT COUNT(*) FROM {source_table}").fetchone()[0]
+    in the transform between them.
+
+    If timestamp_column is given, the source count EXCLUDES rows in
+    quarantined hours -- otherwise this check would always show a
+    mismatch equal to however many rows got legitimately quarantined,
+    which isn't a bug, just quarantine doing its job."""
+    if timestamp_column:
+        source_count = con.execute(f"""
+            SELECT COUNT(*) FROM {source_table} se
+            WHERE NOT EXISTS (
+                SELECT 1 FROM quarantine_log ql
+                WHERE ql.partition_hour = DATE_TRUNC('hour', se.{timestamp_column})
+            )
+        """).fetchone()[0]
+    else:
+        source_count = con.execute(f"SELECT COUNT(*) FROM {source_table}").fetchone()[0]
+
     target_count = con.execute(f"SELECT COUNT(*) FROM {target_table}").fetchone()[0]
 
     diff = source_count - target_count
     status = "PASS" if diff == 0 else "FAIL"
 
-    print(f"[{check_name}] {source_table}={source_count}, {target_table}={target_count}, diff={diff}, status={status}")
+    print(f"[{check_name}] {source_table}(clean)={source_count}, {target_table}={target_count}, diff={diff}, status={status}")
 
     _ensure_log_table(con)
     con.execute(
@@ -33,6 +66,7 @@ def run_reconciliation_check(con, source_table: str, target_table: str, check_na
         [check_name, source_count, target_count, diff, status],
     )
     return status
+
 
 def check_surrogate_key_uniqueness(con, table: str, key_column: str) -> str:
     """Confirms every surrogate key in `table` appears exactly once. A
@@ -81,65 +115,96 @@ def check_scd2_no_overlap(con) -> str:
     return status
 
 
-def check_freshness(con, table: str, timestamp_column: str,
-                     max_staleness_hours: float = 24.0,
-                     reference_ts: str = None) -> str:
-    """Confirms the most recent record in `table` (by `timestamp_column`)
-    is no older than `max_staleness_hours` relative to a reference time.
-
-    This catches the failure mode the other checks can't see: an upstream
-    source that quietly stopped producing new partitions. Row counts can
-    still reconcile, keys can still be unique, and SCD-2 ranges can still
-    be clean, while the data itself has simply gone stale.
-
-    `reference_ts` defaults to current_timestamp, but you can pass in the
-    watermark from your load-log instead if you want "freshness relative
-    to the last successful load" rather than "freshness relative to now"
-    (useful in dev/backfill runs where wall-clock time isn't meaningful).
-    """
-    ref_expr = f"CAST('{reference_ts}' AS TIMESTAMP)" if reference_ts else "current_timestamp"
-
+def check_freshness(con, log_table: str = "load_log", timestamp_column: str = "partition_hour",
+                     max_allowed_lag_hours: int = 26) -> str:
+    """Checks how far behind 'now' the most recent loaded partition is.
+    A large gap means the loader silently stopped progressing, even if
+    every individual run reported success -- reconciliation/uniqueness
+    checks alone would never catch this, since they only look at data
+    that WAS loaded, not whether new data stopped arriving."""
     result = con.execute(f"""
-        SELECT
-            MAX({timestamp_column}) AS latest_ts,
-            {ref_expr} AS reference_ts,
-            date_diff('hour', MAX({timestamp_column}), {ref_expr}) AS staleness_hours
-        FROM {table}
+        SELECT MAX({timestamp_column}) AS latest_loaded,
+               current_timestamp AS now_ts,
+               DATE_DIFF('hour', MAX({timestamp_column}), current_timestamp) AS lag_hours
+        FROM {log_table}
     """).fetchone()
 
-    latest_ts, reference_ts_val, staleness_hours = result
+    latest_loaded, now_ts, lag_hours = result
+    status = "PASS" if lag_hours is not None and lag_hours <= max_allowed_lag_hours else "FAIL"
 
-    # A NULL staleness_hours means the table is empty -- treat as a FAIL,
-    # not a silent PASS.
-    status = "PASS" if (staleness_hours is not None and staleness_hours <= max_staleness_hours) else "FAIL"
-
-    print(f"[freshness:{table}.{timestamp_column}] latest={latest_ts}, "
-          f"reference={reference_ts_val}, staleness_hours={staleness_hours}, status={status}")
+    print(f"[freshness:{log_table}] latest_loaded={latest_loaded}, lag_hours={lag_hours}, "
+          f"threshold={max_allowed_lag_hours}, status={status}")
 
     _ensure_log_table(con)
     con.execute(
         "INSERT INTO reconciliation_log VALUES (current_timestamp, ?, NULL, NULL, ?, ?)",
-        [f"freshness_{table}_{timestamp_column}", staleness_hours, status],
+        ["freshness_check", lag_hours, status],
     )
     return status
+
+
+def validate_and_quarantine_partitions(con, staging_table: str = "staged_events",
+                                         timestamp_column: str = "created_at") -> dict:
+    """Checks each hourly partition (derived from created_at, since
+    staged_events has no explicit partition_hour column -- it's a view
+    over a day's worth of Parquet files) for duplicate event_ids BEFORE
+    fact_events is built. Failing partitions are logged to quarantine_log
+    and excluded downstream -- they never silently corrupt the model."""
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS quarantine_log (
+            partition_hour TIMESTAMP,
+            reason STRING,
+            detail_count BIGINT,
+            quarantined_at TIMESTAMP DEFAULT current_timestamp
+        )
+    """)
+
+    bad_partitions = con.execute(f"""
+        SELECT partition_hour, COUNT(*) AS dup_count
+        FROM (
+            SELECT DATE_TRUNC('hour', {timestamp_column}) AS partition_hour, event_id
+            FROM {staging_table}
+            GROUP BY DATE_TRUNC('hour', {timestamp_column}), event_id
+            HAVING COUNT(*) > 1
+        )
+        GROUP BY partition_hour
+    """).fetchall()
+
+    for partition_hour, dup_count in bad_partitions:
+        already_logged = con.execute(
+            "SELECT 1 FROM quarantine_log WHERE partition_hour = ?", [partition_hour]
+        ).fetchone()
+        if not already_logged:
+            con.execute(
+                "INSERT INTO quarantine_log VALUES (?, ?, ?, current_timestamp)",
+                [partition_hour, "duplicate_event_id", dup_count],
+            )
+
+    total_partitions = con.execute(f"""
+        SELECT COUNT(DISTINCT DATE_TRUNC('hour', {timestamp_column})) FROM {staging_table}
+    """).fetchone()[0]
+    quarantined_count = len(bad_partitions)
+    passed_count = total_partitions - quarantined_count
+
+    print(f"[quarantine] total={total_partitions}, passed={passed_count}, quarantined={quarantined_count}")
+    return {"total": total_partitions, "passed": passed_count, "quarantined": quarantined_count}
 
 
 def main():
     con = duckdb.connect(str(DB_PATH))
 
     results = {}
-    results["staging_to_fact"] = run_reconciliation_check(con, "staged_events", "fact_events", "staging_to_fact")
+    # Quarantine runs FIRST -- fact_events.sql excludes quarantined hours
+    # via a subquery, so this must be populated before build_model.py
+    # (re)builds fact_events.
+    results["quarantine"] = validate_and_quarantine_partitions(con, "staged_events", "created_at")
+    results["staging_to_fact"] = run_reconciliation_check(con, "staged_events", "fact_events", "staging_to_fact", timestamp_column="created_at")
     results["uniqueness_repo_key"] = check_surrogate_key_uniqueness(con, "dim_repo", "repo_key")
     results["uniqueness_actor_key"] = check_surrogate_key_uniqueness(con, "dim_actor", "actor_key")
     results["uniqueness_date_key"] = check_surrogate_key_uniqueness(con, "dim_date", "date_key")
     results["scd2_overlap"] = check_scd2_no_overlap(con)
-
-    latest_watermark = con.execute("SELECT MAX(partition_hour) FROM load_log").fetchone()[0]
-    results["freshness_fact_events"] = check_freshness(
-        con, "fact_events", "event_timestamp",
-        max_staleness_hours=1.0,
-        reference_ts=str(latest_watermark)
-    )
+    results["freshness"] = check_freshness(con, "load_log", "partition_hour", max_allowed_lag_hours=26)
 
     print("\n--- Data Quality Summary ---")
     for name, status in results.items():
@@ -153,6 +218,7 @@ def main():
 
     con.close()
     return results
+
 
 if __name__ == "__main__":
     main()

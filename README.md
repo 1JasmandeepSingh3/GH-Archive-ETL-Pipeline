@@ -49,21 +49,21 @@ data/                    -- gitignored, holds the local DuckDB file and raw/stag
 
 ## How to run
 
-# 1. Ingest + flatten
+### 1. Ingest + flatten
 python scripts/01_inspect_raw.py
 python scripts/02_inspect_raw.py
 python scripts/03_flatten_stage.py
 
-# 2. Build the star schema/Quarentine detection 
+### 2. Build the star schema/Quarentine detection 
 python scripts/build_model.py
 
-# 3. Run the data-quality stage independently
+### 3. Run the data-quality stage independently
 python scripts/data_quality_check.py
 
-# 4. Build the serving layer/Analytical queries
+### 4. Build the serving layer/Analytical queries
 python scripts/build_serving.py
 
-# 5. Watch output of Serving layer Queries
+### 5. Watch output of Serving layer Queries
 python scripts/view_serving_tables.py
 
 

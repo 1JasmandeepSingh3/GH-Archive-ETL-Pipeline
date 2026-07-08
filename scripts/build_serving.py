@@ -6,26 +6,21 @@ DB_PATH = Path("data/gh_archive.duckdb")
 def atomic_refresh(con, final_table_name: str, build_sql: str):
     temp_name = f"{final_table_name}_new"
     old_name = f"{final_table_name}_old"
-
     con.execute(f"DROP TABLE IF EXISTS {temp_name}")
     con.execute(f"CREATE TABLE {temp_name} AS {build_sql}")
-
     new_count = con.execute(f"SELECT COUNT(*) FROM {temp_name}").fetchone()[0]
     if new_count == 0:
         con.execute(f"DROP TABLE {temp_name}")
         raise ValueError(f"Refresh aborted: {final_table_name} query came back empty, not swapping in.")
-
     table_exists = con.execute(f"""
         SELECT COUNT(*) FROM information_schema.tables WHERE table_name = '{final_table_name}'
     """).fetchone()[0] > 0
-
     con.execute(f"DROP TABLE IF EXISTS {old_name}")
     if table_exists:
         con.execute(f"ALTER TABLE {final_table_name} RENAME TO {old_name}")
     con.execute(f"ALTER TABLE {temp_name} RENAME TO {final_table_name}")
     if table_exists:
         con.execute(f"DROP TABLE {old_name}")
-
     print(f"[atomic_refresh] {final_table_name} refreshed with {new_count} rows")
 
 # weekly active repos
@@ -87,17 +82,14 @@ ORDER BY event_date
 
 def main():
     con = duckdb.connect(str(DB_PATH))
-
     atomic_refresh(con, "weekly_active_repos", WEEKLY_ACTIVE_REPOS_SQL)
     atomic_refresh(con, "pr_merge_latency", PR_MERGE_LATENCY_SQL)
     atomic_refresh(con, "top_event_types", TOP_EVENT_TYPES_SQL)
     atomic_refresh(con, "stars_per_day", STARS_PER_DAY_SQL)
-
     print("\n--- Serving layer refresh complete ---")
     for table in ["weekly_active_repos", "pr_merge_latency", "top_event_types", "stars_per_day"]:
         count = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         print(f"  {table}: {count} rows")
-
     con.close()
 
 if __name__ == "__main__":

@@ -4,18 +4,14 @@ import json
 import os
 from collections import Counter
 from pathlib import Path
-
 import requests
 
 RAW_DIR = Path("data/raw")
 DOCS_DIR = Path("docs")
 
-
 def download_hour(date_str: str, hour: int) -> Path:
-    """Download one hourly file if not already on disk. Returns the local path."""
     filename = f"{date_str}-{hour}.json.gz"
     local_path = RAW_DIR / filename
-
     if local_path.exists():
         print(f"  [skip] {filename} already downloaded")
         return local_path
@@ -29,16 +25,9 @@ def download_hour(date_str: str, hour: int) -> Path:
     with open(local_path, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
             f.write(chunk)
-
     return local_path
 
-
 def iter_events(gz_path: Path):
-    """
-    Yield one parsed JSON event at a time from a gzipped file.
-    Each LINE in the file is a complete, standalone JSON object -
-    this is "newline-delimited JSON" (NDJSON), not a single JSON array.
-    """
     with gzip.open(gz_path, "rt", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -46,29 +35,23 @@ def iter_events(gz_path: Path):
                 continue
             yield json.loads(line)
 
-
 def main(date_str: str):
     type_counts = Counter()
     sample_push_event = None
     sample_pr_event = None
-
     print(f"Downloading + inspecting {date_str} (24 hourly files)...")
     for hour in range(24):
         gz_path = download_hour(date_str, hour)
-
         for event in iter_events(gz_path):
             event_type = event.get("type", "UNKNOWN")
             type_counts[event_type] += 1
-
-            # Grab the first full example of each type we care about
             if event_type == "PushEvent" and sample_push_event is None:
                 sample_push_event = event
             if event_type == "PullRequestEvent" and sample_pr_event is None:
                 sample_pr_event = event
-
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # --- Output 1: event type distribution ---
+    # event type distribution 
     dist_path = DOCS_DIR / "event_type_distribution.json"
     with open(dist_path, "w") as f:
         json.dump(dict(type_counts.most_common()), f, indent=2)
@@ -77,7 +60,7 @@ def main(date_str: str):
     for etype, count in type_counts.most_common(5):
         print(f"  {etype}: {count}")
 
-    # --- Output 2: side-by-side structural comparison ---
+    # structural comparison
     comparison_path = DOCS_DIR / "event_structure_comparison.md"
     with open(comparison_path, "w") as f:
         f.write(f"# Event Structure Comparison — {date_str}\n\n")
@@ -92,7 +75,6 @@ def main(date_str: str):
         f.write("  which fields are shared (actor, repo, created_at)?\n")
         f.write("  which fields exist ONLY in one event type (payload.commits vs payload.pull_request)?\n")
     print(f"Wrote {comparison_path}")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

@@ -87,6 +87,8 @@ Repositories get renamed and change owners over time. `dim_repo` preserves this 
 - **Freshness** — checks how far behind "now" the most recent loaded partition is.
    Since the project loads a fixed historical 7-day window rather than a continuously-updating feed, this check will always report `FAIL` against this dataset by design.
 
+## Trade-Offs
+Any duplicate `event_id` currently quarantines the entire hour, even though most duplicates are harmless redelivery rather than real corruption. A stricter version would only quarantine hours with `NULL` key columns (real corruption) and simply deduplicate hours whose only issue is a repeated `event_id`; i.e keeping one copy per event; rather than discarding the whole hour. This was scoped out for time, and is noted here as a deliberate simplification rather than an oversight.
 
 ## Quarantine
 
